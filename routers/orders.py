@@ -13,6 +13,10 @@ router = APIRouter()
 class OrderStatusUpdate(BaseModel):
     orderStatus: str
 
+class OrderUpdate(BaseModel):
+    orderID: int
+    orderStatus: str
+
 # helper function to send order to ims
 async def send_to_ims_api(ims_api_url: str, payload: dict):
     try:
@@ -32,6 +36,18 @@ async def send_to_ims_api(ims_api_url: str, payload: dict):
         logging.error(f"Error sending data to IMS API: {e}")
         raise HTTPException(status_code=500, detail=f'Error sending data to IMS API:{e}')
 
+def parse_datetime(date_str):
+    """Convert string timestamp to datetime format for SQL Server."""
+    if isinstance(date_str, str):
+        try:
+            return datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S')  # Standard format
+        except ValueError:
+            try:
+                return datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S.%f')  # Handles milliseconds
+            except ValueError:
+                return datetime.strptime(date_str, '%Y-%m-%d')  # Handles date only
+    return date_str  # If already datetime, return as-is
+
 
 # receive order from ims
 @router.post('/vms/orders')
@@ -40,7 +56,7 @@ async def receive_order(order: dict):
     try:
         # extract order details
         customer_id = order.get('customerID')
-        order_date = order.get('orderDate', datetime.utcnow())
+        order_date = parse_datetime(order.get('orderDate', datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')))
         order_status = 'Pending'
         products = order.get('products', [])
 
@@ -66,7 +82,7 @@ async def receive_order(order: dict):
         for product in products:
             product_id = product.get('productID')
             quantity = product.get('quantity')
-            expected_date = product.get('expectedDate', (datetime.utcnow() + timedelta(days=7)))
+            expected_date = parse_datetime(product.get('expectedDate', (datetime.utcnow() + timedelta(days=7))))
 
             if not product_id or not quantity:
                 raise HTTPException(status_code=400, detail="invalid product details")
@@ -130,7 +146,7 @@ async def confirm_order(orderID: int, order_status_update: OrderStatusUpdate):
 
             # fetch available variant for the product
             variant_query = f'''select top ({order_quantity}) pv.barcode, pv.productCode, p.productName, 
-                                       p.category, p.color, p.size
+                                       p.category, p.size
                                        from productVariants pv
                                        join Products p 
                                        on pv.productID = p.productID
@@ -144,7 +160,7 @@ async def confirm_order(orderID: int, order_status_update: OrderStatusUpdate):
                 raise HTTPException(status_code=400, detail=f"not enough available variants for productID {product_id}. Required: {order_quantity}, Available: {len(variants)}")
         
         # prepare the payload for IMS if the status is "Confirmed"
-        ims_api_url = "http://127.0.0.1:8000/receive-ordersims/orders/confirm"
+        ims_api_url = "http://127.0.0.1:8000/receive-orders/ims/orders/confirm"
         ims_payload = {"orderID": orderID, "orderStatus": status}
 
         # send the confirmation or rejection to IMS and wait for a response
@@ -275,7 +291,7 @@ async def ship_order(orderID: int):
 
             # Fetch only the required number of product variants (orderQuantity)
             await cursor.execute(
-                '''SELECT TOP (?) pv.barcode, pv.productCode, p.productName, p.category, p.color, p.size
+                '''SELECT TOP (?) pv.barcode, pv.productCode, p.productName, p.category, p.size
                    FROM productVariants pv
                    JOIN products p ON pv.productID = p.productID
                    WHERE pv.productID = ? AND pv.isAvailable = 1
@@ -298,8 +314,7 @@ async def ship_order(orderID: int):
                 "productCode": v[1],
                 "productName": v[2],
                 "category": v[3],
-                "color": v[4],
-                "size": v[5]
+                "size": v[4]
             } for v in variants[:order_quantity]])  
             
         # Send the prepared variants to IMS
@@ -334,6 +349,7 @@ async def ship_order(orderID: int):
         # Commit the changes
         await conn.commit()
 
+        logging.info(f"Sending payload to IMS: {json.dumps(payload, indent=4)}")
         return {
             'message': f"Order {orderID} marked as 'Shipped' and variants sent to IMS successfully.",
             'imsResponse': ims_response
@@ -363,4 +379,92 @@ async def send_to_ims_api_with_retries(url, payload, retries=3, delay=2):
             logging.error(f"Attempt {attempt + 1} failed: {e}")
         await asyncio.sleep(delay)
     raise HTTPException(status_code=500, detail="Failed to send data to IMS after multiple attempts.")
-# comment
+
+@router.get('/vms/orders/shipped')
+async def get_shipped_orders():
+    conn = None
+    try:
+        conn = await database.get_db_connection()
+        cursor = await conn.cursor()
+
+        # fetch all orders with status "Shipped"
+        await cursor.execute(
+            '''
+            select orderID, orderDate, statusDate, customerID
+            from purchaseOrders 
+            where orderStatus = "Shipped"'''
+        ),
+        orders = await cursor.fetchall()
+
+        # if no orders found, return an empty list
+        if not orders:
+            return {"message": "No shipped orders found", "orders": []}
+        
+        #format the results
+        result = [
+            {
+                "orderID": order[0],
+                "orderDate": order[1],
+                "statusDate": order[2],
+                "customerID": order[3]
+            }
+            for order in orders
+        ]
+
+        return {"message": "Shipped orders retrieved successfully", "orders": result}
+    
+    except Exception as e:
+        logging.error(f"Error fetching shipped orders: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch shipped orders")
+    finally: 
+        if conn: 
+            await conn.close()
+
+@router.post('/vms/orders/update-status')
+async def update_order_status(order_update: OrderUpdate):
+    order_id = order_update.orderID
+    order_status = order_update.orderStatus
+    conn = None
+
+    try:
+        conn = await database.get_db_connection()
+        cursor = await conn.cursor()
+
+        # validate order existence in VMS
+        await cursor.execute(
+            '''select orderStatus 
+            from purchaseOrders 
+            where orderID = ?''',
+            (order_id,)
+        )
+        existing_order = await cursor.fetchone()
+
+        if not existing_order:
+            raise HTTPException(status_code=404, detail="Order not found.")
+        
+        # log the current status for debugging
+        logging.info(f"Current order status: {existing_order[0]}")
+
+        # check if the status update is valid
+        if existing_order[0] == order_status:
+            return {"message": "Order status is already up-to-date."}
+        
+        # update the order status
+        await cursor.execute(
+            '''
+            update purchaseOrders
+            set orderStatus = ?, statusDate = getdate()
+            where orderID = ?''',
+            (order_status, order_id)
+        )
+        await conn.commit()
+
+        logging.info(f"Order {order_id} status updated to {order_status}")
+        return {"message": f"Order {order_id} status updated to {order_status}"}
+    
+    except Exception as e:
+        logging.error(f"Error updating order status: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update order status.")
+    finally:
+        if conn:
+            await conn.close()
